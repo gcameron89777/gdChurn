@@ -1,0 +1,617 @@
+---
+title: "Hosting Churn Exploratory and Clustering Analysis"
+output:
+  html_document:
+    df_print: kable
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+toc_depth: 2
+---
+
+
+```{r setup, include=F}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Summary
+
+The purpose of this analysis is to ...
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+
+```{r startup, echo=F, results = 'hide', message=F, cache=F}
+library(tidyverse)
+library(rmarkdown)
+library(lubridate)
+library(scales)
+library(odbc)
+library(dbplyr)
+library(foreach); library(doParallel)
+library(DT)
+library(caret)
+
+# read in data and preprocess
+# churn_data <- readRDS("churn_data_small_pp.rds") # qa and debugging
+churn_data <- readRDS("churn_data_pp.rds")
+```
+
+```{r connection, eval=F, echo=F}
+# hive connection
+con <- dbConnect(odbc::odbc(), "HiveProd")
+churn_data <- tbl(con, in_schema("gcameron", "hosting_churn")) %>% collect()
+nice_names <- str_replace_all(names(churn_data), "hosting_churn.", "")
+names(churn_data) <- nice_names
+```
+
+```{r preprocessing, echo=F, eval=F}
+# preprocessing
+churn_data <- churn_data %>%
+  
+  mutate_at(vars(matches("v_")), funs(as.numeric)) %>% 
+
+  ## it's all 2018 anyway so year doesn't matter
+  mutate(month = month(prior_expiration_date, label = T)) %>%
+  
+  # make factors to order charts in ascending order where appropriate
+  ## easy one liners
+  mutate(product_pnl_line_name = factor(product_pnl_line_name, levels = sort(table(churn_data$product_pnl_line_name), decreasing = T) %>% names())) %>%
+  mutate(shopper_region_1_name = factor(shopper_region_1_name, levels = sort(table(churn_data$shopper_region_1_name), decreasing = F) %>% names())) %>%
+  
+  ## hosting provider type, somewhat ordered
+  mutate(hosting_provider = ifelse(v_count_internal_hosting > 0, "Internal Hosting on Venture",
+                                                 ifelse(v_count_no_hosting_detected > 0, "No Hosting Detected on Venture",
+                                                        ifelse(v_count_hosting_top_ten_competitor > 0, "Top Ten Hosting Competitor on Venture",
+                                                               ifelse(v_count_hosting_long_tail_competitor > 0, "Long Tail Hosting Competitor on Venture", "No Associated Venture to Infer From"))))) %>%
+  mutate(hosting_provider = factor(hosting_provider, levels = c("No Associated Venture to Infer From", "No Hosting Detected on Venture",
+                                                                     "Internal Hosting on Venture", "Top Ten Hosting Competitor on Venture",
+                                                                     "Long Tail Hosting Competitor on Venture"))) %>%
+  
+  ## tenure bin
+  mutate(tenure_bin = ifelse(tenure_months < 13, "<1 Year",
+                             ifelse(tenure_months <= 24, "<2 Years",
+                                    ifelse(tenure_months <= 36, "<3 Years",
+                                           ifelse(tenure_months < 60, "<5 Years", ">5 Years"))))) %>%
+  mutate(tenure_bin = factor(tenure_bin, levels = c("<1 Year", "<2 Years", "<3 Years", "<5 Years", ">5 Years"))) %>%
+  
+  ## domains count
+  mutate(count_domains_bin = ifelse(v_count_domains < 1, "0 Domains",
+                                    ifelse(v_count_domains < 2, "1 Domain",
+                                           ifelse(v_count_domains < 4, "<3 Domains",
+                                                  ifelse(v_count_domains <6, "<5 Domains", ">5 Domains"))))) %>%
+  mutate(count_domains_bin = factor(count_domains_bin, levels = c("0 Domains", "1 Domain", "<3 Domains", "<5 Domains", ">5 Domains"))) %>%
+  
+  # ## gcr 12 months
+  mutate(gcr_12_months_bin = ifelse(v_sum_gcr_allocated_12month < 100, "<100",
+                                     ifelse(v_sum_gcr_allocated_12month < 300, "<300",
+                                            ifelse(v_sum_gcr_allocated_12month < 500, "<500",
+                                                   ifelse(v_sum_gcr_allocated_12month < 1000, "<1000", ">1000"))))) %>%
+  mutate(gcr_12_months_bin = factor(gcr_12_months_bin, levels = c("<100", "<300", "<500", "<1000", ">1000"))) %>% 
+  
+  # competitive provider changes hot encode
+  ## if less than 0 switched to a competitor
+  mutate_at(vars(matches("change")), funs(ifelse(. < 0, 1, 0))) %>% 
+  
+  # how many are attached to a venture
+  ## if report_date is null, no venture
+  mutate(venture_attached = ifelse(is.na(report_date), "No Venture", "Has Venture"))
+
+
+saveRDS(churn_data, "hosting_data_pp.rds")
+```
+
+```{r functions, echo=F, results = 'hide', message=F, cache=F}
+# functions
+plot_trends <- function(df, by_var1, by_var2) {
+  # default 2 dimensions will be renewal flag as color and pnl line name as rows
+  # so just ploting var as columns
+  
+  by_var1 <- enquo(by_var1)
+  by_var2 <- enquo(by_var2)
+  
+  # group by and summarise for churn rate
+  plot_data <- churn_data %>%
+    group_by(month, auto_renewal_flag, !!by_var1, !!by_var2) %>% 
+    summarise(Instances_Of_Expiration = n(),
+              Churns = sum(churned),
+              Churn_Rate = round(Churns / Instances_Of_Expiration, 2)) %>% 
+    arrange(month, !!by_var1, !!by_var2)
+  
+  # plot
+  ggplot(plot_data, aes(x = month, y = Churn_Rate, group = auto_renewal_flag, color = auto_renewal_flag)) +
+    geom_line() +
+    facet_grid(cols = vars(!!by_var2),
+               rows = vars(!!by_var1),
+               labeller = label_wrap_gen(width = 10)) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    scale_y_continuous(breaks = seq(0, 1, by = 0.5)) +
+     labs(title = paste0("Hosting Churn by ", quo_name(by_var1), " & ", quo_name(by_var2)),
+          x = "2018",
+          y = "Churn Rate")
+
+  } # end plot_trends
+
+```
+
+\pagebreak
+
+# Exploratory Analysis
+## Overview of Data
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+```{r glimpse, echo=F}
+glimpse(churn_data %>% select(report_date:v_change_external_ssl_petal_count))
+```
+
+\pagebreak
+
+### Churned Resource IDs:
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+#### By Product PNL Line Name
+```{r cats_namespace, echo=F}
+churn_data %>% group_by(product_pnl_line_name) %>% summarise(Instances_Of_Expiration = n(),
+                                                             Churns = sum(churned),
+                                                             Churn_Rate = round(Churns / Instances_Of_Expiration, 2)) %>% 
+  arrange(desc(Instances_Of_Expiration)) %>% DT::datatable(options = list(paging = F, searching = F), rownames = F)
+```
+
+Learnings:
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+#### By Region1
+```{r cats_region1, echo=F}
+churn_data %>% group_by(shopper_region_1_name) %>% summarise(Instances_Of_Expiration = n(),
+                                                   Churns = sum(churned),
+                                                   Churn_Rate = round(Churns / Instances_Of_Expiration, 2)) %>% 
+  arrange(desc(Instances_Of_Expiration)) %>% DT::datatable(options = list(paging = F, searching = F), rownames = F)
+```
+
+Learnings:
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+#### By Auto Renewal Flag
+
+```{r cats_auto_renew, echo=F}
+churn_data %>% group_by(auto_renewal_flag) %>% summarise(Instances_Of_Expiration = n(),
+                                                   Churns = sum(churned),
+                                                   Churn_Rate = round(Churns / Instances_Of_Expiration, 2)) %>% 
+  arrange(desc(Instances_Of_Expiration)) %>% DT::datatable(options = list(paging = F, searching = F), rownames = F)
+```
+
+Learnings:
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+#### By Competitive Hosting Bin
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+
+```{r cats_venture_hosting_competitor, echo=F}
+churn_data %>%
+  group_by(hosting_provider) %>% 
+  summarise(Instances_Of_Expiration = n(),
+            Churns = sum(churned),
+            Churn_Rate = round(Churns / Instances_Of_Expiration, 2)) %>% 
+  arrange(desc(Instances_Of_Expiration)) %>% DT::datatable(options = list(paging = F, searching = F), rownames = F)
+```
+
+Learnings:
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+\pagebreak
+
+#### By Change in Status of External Services
+(1 indicates a switch to a external provider for each respective service.)
+
+(Only hosting resources with a venture linked to them)
+```{r external_glimpse_nodes_change, echo=F}
+churn_data %>%
+  filter(!is.na(report_date)) %>% # venture found
+  group_by(v_change_attached_external_node_count) %>% 
+  summarise(Instances_Of_Expiration = n(),
+            Churns = sum(churned),
+            Churn_Rate = round(Churns / Instances_Of_Expiration, 2)) %>% 
+  arrange(desc(Instances_Of_Expiration)) %>% DT::datatable(options = list(paging = F, searching = F), rownames = F)
+
+churn_data %>%
+  group_by(v_change_external_domain_petal_count) %>% 
+  summarise(Instances_Of_Expiration = n(),
+            Churns = sum(churned),
+            Churn_Rate = round(Churns / Instances_Of_Expiration, 2)) %>% 
+  arrange(desc(Instances_Of_Expiration)) %>% DT::datatable(options = list(paging = F, searching = F), rownames = F)
+
+churn_data %>%
+  group_by(v_change_external_website_petal_count) %>% 
+  summarise(Instances_Of_Expiration = n(),
+            Churns = sum(churned),
+            Churn_Rate = round(Churns / Instances_Of_Expiration, 2)) %>% 
+  arrange(desc(Instances_Of_Expiration)) %>% DT::datatable(options = list(paging = F, searching = F), rownames = F)
+
+churn_data %>%
+  group_by(v_change_external_mail_petal_count) %>% 
+  summarise(Instances_Of_Expiration = n(),
+            Churns = sum(churned),
+            Churn_Rate = round(Churns / Instances_Of_Expiration, 2)) %>% 
+  arrange(desc(Instances_Of_Expiration)) %>% DT::datatable(options = list(paging = F, searching = F), rownames = F)
+
+churn_data %>%
+  group_by(v_change_external_ssl_petal_count) %>% 
+  summarise(Instances_Of_Expiration = n(),
+            Churns = sum(churned),
+            Churn_Rate = round(Churns / Instances_Of_Expiration, 2)) %>% 
+  arrange(desc(Instances_Of_Expiration)) %>% DT::datatable(options = list(paging = F, searching = F), rownames = F)
+```
+
+Learnings:
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+\pagebreak
+
+## Trends
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+### Overall Churn Rate, Monthly Trend
+(Pre drill down and segmentation)
+
+```{r overall_churn_rate_trend, echo=F, message=F, warning=F}
+plot_data <- churn_data %>% 
+  group_by(month) %>% 
+  summarise(Instances_Of_Expiration = n(),
+            Churns = sum(churned),
+            Churn_Rate = round(Churns / Instances_Of_Expiration, 2)) %>% 
+  arrange(month)
+
+ggplot(plot_data, aes(x = month, y = Churn_Rate)) +
+  geom_line(group = 1) +
+  expand_limits(y = c(0, 0.3)) +
+  labs(title = "Overall Churn Rate",
+       x = "2018",
+       y = "Churn Rate")
+```
+  
+Learnings:
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+\pagebreak
+
+### Churn Rate Trend By Auto Renewal Flag
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+```{r auto_renew_flag_churn_rate_trend, echo=F, message=F, warning=F}
+plot_data <- churn_data %>% 
+  group_by(month, auto_renewal_flag) %>% 
+  summarise(Instances_Of_Expiration = n(),
+            Churns = sum(churned),
+            Churn_Rate = round(Churns / Instances_Of_Expiration, 2)) %>% 
+  arrange(month)
+
+ggplot(plot_data, aes(x = month, y = Churn_Rate, group = auto_renewal_flag, color = auto_renewal_flag)) +
+  geom_line() +
+  expand_limits(y = c(0, 0.3)) +
+  labs(title = "By Auto Renew Churn Rate",
+       x = "2018",
+       y = "Churn Rate")
+```
+
+Learnings:
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+\pagebreak
+
+### Churn Rate Trend By Product PNL Line Name
+```{r pnl_name__churn_rate_trend, echo=F, message=F, warning=F}
+plot_data <- churn_data %>% 
+  group_by(month, auto_renewal_flag, product_pnl_line_name) %>% 
+  summarise(Instances_Of_Expiration = n(),
+            Churns = sum(churned),
+            Rate = round(Churns / Instances_Of_Expiration, 2)) %>% 
+  arrange(month)
+
+ggplot(plot_data, aes(x = month, y = Rate, group = auto_renewal_flag, color = auto_renewal_flag)) +
+  geom_line() +
+  facet_grid(rows = vars(product_pnl_line_name),
+             labeller = label_wrap_gen(width = 10)) +
+  expand_limits(y = c(0, 0.3)) +
+  labs(title = "By Product PNL Line Name Churn Rate",
+       x = "2018",
+       y = "Churn Rate")
+```
+
+Learnings:
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+\pagebreak
+
+### Churn Rate Trend By By Region
+```{r region_churn_rate_trend, echo=F, message=F, warning=F}
+plot_trends(churn_data, product_pnl_line_name, shopper_region_1_name)
+```
+
+Learnings:
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+
+```{r avg_tenure_region, echo=F, message=F, warning=F}
+churn_data %>% group_by(shopper_region_1_name) %>% summarise(Size = n(),
+                                              Avg_Tenure_Months = round(mean(tenure_months), 2)) %>% 
+  arrange(desc(Avg_Tenure_Months)) %>% DT::datatable(options = list(paging = F, searching = F), rownames = F)
+
+```
+
+\pagebreak
+
+### Churn by Tenure
+```{r churn_rate_tenure, echo=F,echo=F, message=F, warning=F, results='hide', fig.keep='all'}
+plot_trends(churn_data, product_pnl_line_name, tenure_bin)
+```
+
+Learnings:
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+\pagebreak
+
+## Venture Data Analysis
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+
+### Hosting resources Associated with a Venture
+```{r proportion_venture, echo=F, message=F, warning=F}
+churn_data %>%
+  group_by(venture_attached) %>% 
+  summarise(Instances_Of_Expiration = n(),
+            Churns = sum(churned),
+            Churn_Rate = round(Churns / Instances_Of_Expiration, 2)) %>% 
+  arrange(desc(Instances_Of_Expiration)) %>% DT::datatable(options = list(paging = F, searching = F), rownames = F)
+```
+
+Learnings:
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+### Trend of Churn by Venture Hosting Provider
+```{r venture_churn_rate_hosting_provider, echo=F, message=F, warning=F, results='hide', fig.keep='all'}
+plot_trends(churn_data, product_pnl_line_name, hosting_provider)
+```
+
+Learnings:
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+\pagebreak
+
+### Churn by Count of Domains
+```{r venture_churn_by_domains_count, echo=F, message=F, warning=F, results='hide', fig.keep='all'}
+plot_trends(churn_data, product_pnl_line_name, count_domains_bin)
+```
+
+Learnings:
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+\pagebreak
+
+### Churn by Count of Domains Segmented By Hosting Competitor
+Checking for a relationship between use of a competitor and count of domains with ___.
+
+```{r venture_churn_by_domains_count_competitor, echo=F, message=F, warning=F, results='hide', fig.keep='all'}
+plot_trends(churn_data, hosting_provider, count_domains_bin)
+```
+
+Learnings:
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+### Churn by 12 Month Venture GCR Segmented By Hosting Competitor
+```{r venture_churn_by_gcr_count_competitor, echo=F, message=F, warning=F, results='hide', fig.keep='all'}
+plot_trends(churn_data, hosting_provider, gcr_12_months_bin)
+```
+
+Learnings:
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+\pagebreak
+
+# Cluster Analysis
+This section uses clustering analysis to find naturally occuring groups within the data, as well as any new or emerging trends. data are clustered only on those who churned which was `r nrow(churn_data %>% filter(churned ==1))` instances.
+Method used is kmeans with scaled data on a subset of features only. This is because:
+
+1. Kmeans will treat each variable with equal weight, so 12 Months GCR might be in the hundreds while count of external domains could be 1 or 2. Scaling tells the algorithm to treat each variable on the same scale without giving a distorting amount of weight to a feature that happens to be on a higher scale.
+2. Kmeans is fast and able to return a cluster vector given the size of the data.
+3. Other approaches exist but for this initial exploratory analysis, Kmeans is chosen for speed and simplicity.
+
+### Preprocessing on clustering step:
+1. Filtered to only include those who churned i.e. clustering on churned resources only to understand naturally occuring groups of churners.
+2. Clustering variables (Scaled before passing to kmeans) include:
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+          
+## Choosing Cluster Count
+To determine the number of clusters, use elbow method of measuring within cluster sum of squared variance:
+          
+```{r clustering, eval=F, echo=F, message=F, warning=F, results='hide'}
+# create data frame of scaled chosen features to cluster on
+cluster_vars <- c("tenure_months", "product_pnl_line_name", "auto_renewal_flag", 
+                  "shopper_region_1_name", "v_count_ventures", "v_count_internal_hosting", 
+                  "v_count_hosting_top_ten_competitor", "v_count_hosting_long_tail_competitor", 
+                  "v_change_attached_external_node_count")
+
+clustering_df <- churn_data %>% filter(churned == 1) %>% select_at(vars(cluster_vars))
+
+## hot encode product pnl line name
+for(p in unique(clustering_df$product_pnl_line_name)){
+  clustering_df[paste0("pnl_line.", p)] <- ifelse(clustering_df$product_pnl_line_name == p, 1, 0)
+}
+
+## hot encode region1
+for(r in unique(clustering_df$shopper_region_1_name)){
+  clustering_df[paste0("region1.", r)] <- ifelse(clustering_df$shopper_region_1_name == r, 1, 0)
+}
+
+## make auto renewal flag binary
+clustering_df <- clustering_df %>% mutate(auto_renewal_flag = ifelse(auto_renewal_flag == T, 1, 0))
+
+## scale continuous data for kmeans to not treat differing variables disproportionately
+## scale between 0 and 1 to match binary features scale
+## kmeans needs data of same type
+clustering_df_scaled <- lapply(clustering_df %>% select(-c(product_pnl_line_name, shopper_region_1_name)), 
+                               function(x) {(x-min(x))/(max(x)-min(x))}) %>% as.data.frame()
+
+# Clustering
+## Determine number of clusters to go with
+## try with between 25 and 125 clusters
+try_centers <- seq(from = 3, to = 50, by = 1)
+
+## take a sample for determining the number of clusters with elbow chart, not enough time or RAM to work on full data. Try 100k
+small_clustering_df <- sample_n(clustering_df_scaled, 100000)
+ 
+set.seed(123)
+cl <- makeCluster(8)
+registerDoParallel(cl)
+wss_list <- foreach(k = try_centers) %dopar% {
+  print(paste0("Starting center: ", k))
+  kmeans(small_clustering_df, centers = k, nstart = 10, iter.max = 30)
+}
+stopCluster(cl)
+saveRDS(wss_list, "rds_files/wss_list.rds")
+```
+
+```{r elbow, echo=F, message=F, warning=F, results='hide'}
+try_centers <- seq(from = 3, to = 50, by = 1)
+wss_list <- readRDS("rds_files/wss_list.rds")
+
+## get wss from each iteration
+wss <- lapply(wss_list, function(i) i$tot.withinss) %>% unlist()
+
+## plot elbow chart
+plot(try_centers, wss) # within sum of squares levels off after around 14 clusters
+```
+
+After 10 clusters seems to be where the leveling off takes place. Following analysis is for 5:20 clusters in increments of 5.
+
+```{r clustering_520, eval=F, echo=F, message=F, warning=F, results='hide'}
+# Now clustering on full data
+# Only do once. Save onto original data frame for time efficiency so don;t have to re run again.
+# try_centers <- seq(from = 15, to = 35, by = 5)
+ 
+set.seed(123)
+cluster_520 <- seq(from = 5, to = 20, by = 5)
+wss_list <- foreach(k = cluster_520) %do% {
+  print(paste0("Starting center: ", k))
+  clust <- kmeans(clustering_df_scaled, centers = k, nstart = 10, iter.max = 30)
+  saveRDS(clust, paste0("rds_files/cluster_", k, ".rds"))
+  return(1)
+}
+
+
+clustered_churners <- churn_data %>% filter(churned == 1) %>% 
+  mutate(cluster_5 = readRDS("rds_files/cluster_5.rds")$cluster,
+         cluster_10 = readRDS("rds_files/cluster_10.rds")$cluster,
+         cluster_15 = readRDS("rds_files/cluster_15.rds")$cluster,
+         cluster_20 = readRDS("rds_files/cluster_20.rds")$cluster)
+
+## hot encode pnl
+for(p in unique(clustered_churners$product_pnl_line_name)){
+  clustered_churners[paste0("pnl_line.", p)] <- ifelse(clustered_churners$product_pnl_line_name == p, 1, 0)
+}
+
+## hot encode region1
+for(r in unique(clustered_churners$shopper_region_1_name)){
+  clustered_churners[paste0("region1.", r)] <- ifelse(clustered_churners$shopper_region_1_name == r, 1, 0)
+}
+
+saveRDS(clustered_churners, "clustered_churners.rds", ascii = T)
+```
+
+
+```{r cluster_summary, echo=F, message=F, warning=F}
+cluster_summary <- function(df, cluster) {
+
+  cl <- enquo(cluster)
+    
+  df %>% group_by(!!cl) %>%
+  summarise(
+                
+                # Universal Variables
+                Cluster_Size = n(),
+                Avg_Tenure_Months = round(mean(tenure_months), 3),
+                Avg_Auto_Renewal = round(mean(as.numeric(auto_renewal_flag)), 3),
+                Avg_Count_Ventures = round(mean(v_count_ventures), 3),
+                Avg_Internally_Hosted_Ventures = round(mean(v_count_internal_hosting), 3),
+                Avg_Count_Ventures_Hosted_Top_Ten_Competitor = round(mean(v_count_hosting_top_ten_competitor), 3),
+                Avg_Count_Ventures_Hosted_Long_Tail_Competitor = round(mean(v_count_hosting_long_tail_competitor), 3),
+                Avg_Change_Attached_External_Nodes = round(mean(v_change_attached_external_node_count), 3),
+                
+                # Region1
+                Avg_Count_United_States = round(mean(`region1.United States`), 2),
+                Avg_Count_Canada = round(mean(region1.Canada), 2),
+                Avg_Count_EMEA = round(mean(region1.EMEA), 2),
+                Avg_Count_APAC = round(mean(region1.APAC), 2),
+                Avg_Count_LatAm = round(mean(region1.LatAm), 2),
+                Avg_Count_Region1_Others = round(mean(region1.Others), 2),
+                
+                # PNL Line Name
+                Avg_Count_Pnl_Grid = round(mean(pnl_line.Grid), 2),
+                Avg_Count_Pnl_Shared_Hosting = round(mean(`pnl_line.Shared Hosting`), 2),
+                Avg_Count_Pnl_Cnp = round(mean(`pnl_line.CnP Hosting`), 2),
+                Avg_Count_Pnl_WP = round(mean(pnl_line.Wordpress), 2),
+                Avg_Count_Pnl_WPMP = round(mean(`pnl_line.WordPress Managed Plans`), 2),
+                Avg_Count_Pnl_Paid_Support = round(mean(`pnl_line.Paid Support`))) %>% 
+    
+    arrange((!!cl)) %>% 
+    
+    # Kable will wrap automatically if spaces
+    select_all(funs(gsub("_", " ", .))) 
+}
+```
+
+## Cluster Summary {.tabset .tabset-fade .tabset-pills}
+Select number of clusters to see summary data aggregated for each cluster.
+
+### Cluster5
+```{r clustering_5, echo=F, message=F, warning=F}
+clustered_churners <- readRDS("clustered_churners.rds")
+cluster_summary(clustered_churners, cluster_5) %>% DT::datatable(options = list(paging = F, searching = F), rownames = F)
+```
+
+### Cluster10 {.active}
+```{r clustering_10, echo=F, echo=F, message=F, warning=F}
+cluster_summary(clustered_churners, cluster_10) %>% DT::datatable(options = list(paging = F, searching = F), rownames = F)
+```
+
+### Cluster15
+```{r clustering_15, echo=F, message=F, warning=F}
+cluster_summary(clustered_churners, cluster_15) %>% DT::datatable(options = list(paging = F, searching = F), rownames = F)
+```
+
+### Cluster20
+```{r clustering_20, echo=F, message=F, warning=F}
+cluster_summary(clustered_churners, cluster_20) %>% DT::datatable(options = list(paging = F, searching = F), rownames = F)
+```
+
+## Cluster Trends
+For 10 clusters, trends for 2018:
+```{r cluster_trends, echo=F, message=F, warning=F}
+clustered_churners %>% mutate(cluster_10 = factor(cluster_10)) %>% group_by(month, cluster_10) %>% summarise(Count = n()) %>% 
+  ggplot(aes(x = month, y = Count, group = cluster_10, color = cluster_10)) +
+  geom_line()
+
+# clear RAM and garbage collection
+rm(list = ls()); invisible(gc())
+```
+
+Learnings based on 10 cluster groupings:
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.

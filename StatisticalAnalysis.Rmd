@@ -1,0 +1,623 @@
+---
+title: "Hosting Statistical Modeling"
+output:
+  html_document:
+    df_print: kable
+    toc: yes
+    toc_collapsed: yes
+    toc_float: yes
+toc_depth: 2
+---
+
+
+```{r setup, include=F}
+knitr::opts_chunk$set(echo = T)
+```
+
+## Summary & Approach
+
+This part of the analysis covers a logistic regression approach to understanding the features covered.
+
+Logistic regression chosen as the method of statistical modeling because:
+
+* Goal of the analysis is inference
+* Fast and easy to interpret coefficients
+    + Ability to interact and transform variables as well as interpret these transformations (e.g. particular interest in long tenured USA accounts and churn which will be an interaction feature).
+
+Approach:
+
+* Stepwise logistic regression
+    + Step fowards (Based on feature significance (P-values))
+    + Step backwards (Based on evaluation metric prAUC) # verify
+    + Mixed. Stepforwards and backwards based on both feature significance and prAUC
+* 5 Fold Cross validation (Reduce chance of a bias estimate of evaluation metric in training data)
+* Evaluation metric prAUC (Imbalanced data)
+
+```{r libraries, echo=F, results = 'hide', message=F, cache=F}
+library(tidyverse)
+library(rmarkdown)
+library(lubridate)
+library(scales)
+library(odbc)
+library(dbplyr)
+library(DT)
+library(caret)
+```
+
+```{r odbc_data, eval=F, message=F, cache=F, include=F, results='hide'}
+# hive connection
+con <- dbConnect(odbc::odbc(), "HiveProd")
+churn_data <- tbl(con, in_schema("gcameron", "hosting_churn")) %>% collect()
+nice_names <- str_replace_all(names(churn_data), "hosting_churn.", "")
+names(churn_data) <- nice_names
+
+# save
+saveRDS(churn_data, "stats_rds/churn_data_raw.rds")
+```
+
+```{r read_data, message=F, cache=F, include=F}
+churn_data <- readRDS("stats_rds/churn_data_raw.rds")
+```
+
+```{r pp_data, message=F, cache=F, include=F}
+churn_data <- churn_data %>% 
+  
+  # weird int64 from odbc get rid of those
+  mutate_at(vars(matches("v_")), funs(as.numeric)) %>% 
+
+  ## it's all 2018 anyway so year doesn't matter
+  mutate(month = month(prior_expiration_date, label = T))
+
+# features to be included
+training_vars <- c("tenure_months", 
+                   "product_pnl_line_name", 
+                   "auto_renewal_flag", 
+                   "shopper_region_1_name",
+                   "v_sum_gcr_allocated_12month",
+                   "v_count_ventures",
+                   "v_count_hosting_top_ten_competitor",
+                   "v_count_hosting_long_tail_competitor",
+                   "v_count_domains",
+                   "v_count_email",
+                   "v_count_ssl",
+                   "v_count_internal_hosting",
+                   "v_count_no_hosting_detected",
+                   "v_count_hosting_top_ten_competitor",
+                   "v_count_hosting_long_tail_competitor",
+                   "v_change_attached_external_node_count",
+                   "v_change_external_domain_petal_count",
+                   "v_change_external_mail_petal_count",
+                   "v_change_external_ssl_petal_count")
+
+# seperate target and factor, then filter to create training data frame
+target_churned <- churn_data$churned %>% make.names() %>% factor(levels = c("X0", "X1"))
+
+training_data <- churn_data[training_vars]
+
+# make dummy vars
+dummy <- caret::dummyVars(~ product_pnl_line_name + shopper_region_1_name, 
+                          data = training_data, fullRank = F, sep = ".")
+dummy_df <- predict(dummy, training_data) %>% as.data.frame()
+training_data <- c(training_data, dummy_df) %>% data.frame() %>% 
+  select(-c(product_pnl_line_name, shopper_region_1_name))
+
+# add in interaction and quadratic terms
+training_data <- training_data %>% 
+  mutate(usa_tenure = shopper_region_1_nameUnited.States * tenure_months,
+         tenure_quadratic = tenure_months^2)
+
+# save
+# saveRDS(training_data, "stats_rds/training_data.rds")
+```
+
+```{r train_control, eval=F, message=F, cache=F, include=F}
+my_summary  <- function(data, lev = NULL, model = NULL){
+  a1 <- defaultSummary(data, lev, model)
+  b1 <- twoClassSummary(data, lev, model) # Regular ROC AUC
+  c1 <- prSummary(data, lev, model) # precision recall AUC
+  out <- c(a1, b1, c1)
+  out}
+
+## tuning & parameters
+set.seed(123)
+train_control <- trainControl(
+  method = "cv", # cross validation
+  number = 5, # 5 folds
+  savePredictions = TRUE,
+  verboseIter = TRUE, 
+  classProbs = TRUE, # will use these for model plots later
+  summaryFunction = my_summary
+)
+```
+
+```{r best_approach_using_sample, eval=F, message=F, cache=F, include=F}
+training_data_small <- training_data %>% mutate(target_churned = target_churned) %>% sample_n(100000)
+target_churned_small <- training_data_small$target_churned
+training_data_small <- training_data_small %>% select(-target_churned)
+
+# step forwards model
+step_forward_model = train(
+  x = training_data_small,
+  y = target_churned_small,
+  trControl = train_control,
+  method = "glmStepAIC", # logistic regression
+  direction = "forward",
+  family = "binomial",
+  metric = "AUC"
+)
+# saveRDS(step_forward_model, "stats_rds/step_forward_model.rds")
+
+# step backwards model
+step_backward_model = train(
+  x = training_data_small,
+  y = target_churned_small,
+  trControl = train_control,
+  method = "glmStepAIC", # logistic regression
+  direction = "backward",
+  family = "binomial",
+  metric = "AUC"
+)
+# saveRDS(step_backward_model, "stats_rds/step_backward_model.rds")
+
+# step both model
+step_both_model = train(
+  x = training_data_small,
+  y = target_churned_small,
+  trControl = train_control,
+  method = "glmStepAIC", # logistic regression
+  direction = "both",
+  family = "binomial",
+  metric = "AUC"
+)
+# saveRDS(step_both_model, "stats_rds/step_both_model.rds")
+```
+
+## Stepwise Model Results
+
+```{r cv_summary, echo=F, message=F, cache=F}
+# store results
+results <- resamples(list(
+  forwards = readRDS("stats_rds/step_forward_model.rds"),
+  backwards  = readRDS("stats_rds/step_backward_model.rds"),
+  mixed = readRDS("stats_rds/step_both_model.rds")
+))
+# saveRDS(results, "stats_rds/results.rds")
+
+# evaluate models based on prAUC
+summary(results)
+dotplot(results)
+
+rm(list = ls()); invisible(gc())
+```
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+```{r fit_main_model, eval=F, message=F, cache=F, include=F}
+training_data <- readRDS("stats_rds/training_data.rds")
+target_churned <- readRDS("stats_rds/target_churned.rds")
+step_both_model <- readRDS("stats_rds/step_both_model.rds")
+
+# combine and take a sample
+training_data <- training_data %>% mutate(target_churned = target_churned) %>% 
+  sample_n(1000000)
+target_churned <- training_data$target_churned
+training_data <- training_data %>% select(-target_churned)
+
+# subset based on best model earlier
+chosen_vars <- attr(terms(formula(step_both_model$finalModel)), "term.labels") %>% c("shopper_region_1_nameUnited.States") # ensure USA remians since used in interaction
+training_data <- training_data[chosen_vars]
+
+# step both main model 1M
+step_both_model_main = train(
+  x = training_data,
+  y = target_churned,
+  trControl = train_control,
+  method = "glm", # logistic regression
+  family = "binomial",
+  metric = "AUC"
+)
+
+saveRDS(step_both_model_main, "stats_rds/step_both_model_main_1m.rds")
+```
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+```{r model_summary, echo=F, message=F, warning=F}
+main_model <- readRDS("stats_rds/step_both_model_main_1m.rds")
+
+
+broom::tidy(main_model$finalModel) %>%
+  mutate(odds_ratio = exp(estimate),
+         significant_5_pct = ifelse(p.value <= 0.05, TRUE, FALSE)) %>% 
+  DT::datatable(options = list(paging = F, searching = F), rownames = F)
+
+# clear ram and garbage collection
+rm(list = ls()); invisible(gc())
+```
+
+[Summary on coeffficents and odds ratio]
+
+```{r model_predictions, eval=F, echo=F, message=F, warning=F}
+main_model <- readRDS("stats_rds/step_both_model_main_1m.rds")
+
+# predict onto original data for visualizing probability
+training_data <- readRDS("stats_rds/training_data.rds")
+n <- 1000000
+nr <- nrow(training_data)
+pieces <- split(training_data, rep(1:ceiling(nr/n), each = n, length.out = nr))
+preds <- lapply(pieces, function(x) {
+  predict(main_model,
+          newdata = x,
+          type = "prob")})
+preds <- do.call(rbind, preds)
+
+# rejoin onto original data and save to rds
+churn_data <- readRDS("stats_rds/churn_data_raw.rds")
+churn_data_with_predictions <- cbind(churn_data, preds) %>% data.frame()
+# saveRDS(churn_data_with_predictions, "stats_rds/churn_data_with_predictions.rds")
+
+# clear ram and garbage collection
+rm(list = ls()); gc()
+```
+
+## Model Visuals
+
+```{r model_data_visual, eval=F, echo=F, message=F, warning=F}
+
+modeling_data <- readRDS("stats_rds/churn_data_with_predictions.rds") %>%
+  mutate(month = month(prior_expiration_date, label = T)) %>% # it's all 2018 anyway so year doesn't matter
+  rename(Probability_Churn = X1) # nice names
+```
+
+### Churn Rate Prediction Overall
+
+```{r mdl_vsl_overall, eval=T, echo=F, message=F, warning=F, results='hide', fig.keep='all'}
+
+# plot data
+modeling_data <- readRDS("stats_rds/modeling_data.rds") %>% 
+  group_by(month) %>% 
+  summarise(Probability_Churn = round(mean(Probability_Churn), 2))
+
+# Overall churn rate
+ggplot(modeling_data, aes(x = month, 
+                          y = Probability_Churn)) +
+  geom_line(group = 1) +
+  expand_limits(y = c(0, 0.6)) +
+  labs(title = "Overall Predicted Churn Probability",
+       x = "2018",
+       y = "Churn Probability")
+
+rm(list = ls()); invisible(gc())
+```
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+### Churn Rate Prediction By Auto Renewal Flag
+
+```{r mdl_vsl_auto_renew, eval=T, echo=F, message=F, warning=F, results='hide', fig.keep='all'}
+
+# predicted churn rate by auto renewal flag
+ggplot(
+  
+  # get data right
+  modeling_data <- readRDS("stats_rds/modeling_data.rds") %>% 
+    group_by(month, auto_renewal_flag) %>% 
+    summarise(Prob_Churn = round(mean(Probability_Churn), 2)), 
+       
+  ## ggplot     
+  aes(x = month, y = Prob_Churn, group = auto_renewal_flag, color = auto_renewal_flag)) +
+  geom_line() +
+  expand_limits(y = c(0, 0.6)) +
+  labs(title = "Modelled Churn By Auto Renewal",
+       x = "2018",
+       y = "Churn Probability")
+
+rm(list = ls()); invisible(gc())
+```
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+### Churn Rate Prediction By Product
+
+```{r mdl_vsl_product, eval=T, echo=F, message=F, warning=F, results='hide', fig.keep='all'}
+
+ggplot(
+  
+  # get data right
+  modeling_data <- readRDS("stats_rds/modeling_data.rds") %>% 
+    group_by(month, auto_renewal_flag, product_pnl_line_name) %>% 
+    summarise(Prob_Churn = round(mean(Probability_Churn), 2)), 
+       
+  ## ggplot     
+  aes(x = month, y = Prob_Churn, group = auto_renewal_flag, color = auto_renewal_flag)) +
+  geom_line() +
+  facet_grid(rows = vars(product_pnl_line_name),
+             labeller = label_wrap_gen(width = 10)) +
+  expand_limits(y = c(0, 0.6)) +
+  labs(title = "Modelled Churn By Auto Renewal",
+       x = "2018",
+       y = "Churn Probability")
+
+rm(list = ls()); invisible(gc())
+```
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+### Churn Rate Prediction By Product & Region1
+
+```{r mdl_vsl_region, eval=T, echo=F, message=F, warning=F, results='hide', fig.keep='all'}
+
+ggplot(
+  
+  # get data right
+  modeling_data <- readRDS("stats_rds/modeling_data.rds") %>% 
+    group_by(month, auto_renewal_flag, product_pnl_line_name, shopper_region_1_name) %>% 
+    summarise(Prob_Churn = round(mean(Probability_Churn), 2)), 
+       
+  ## ggplot     
+  aes(x = month, y = Prob_Churn, group = auto_renewal_flag, color = auto_renewal_flag)) +
+  geom_line() +
+  facet_grid(rows = vars(product_pnl_line_name),
+             cols = vars(shopper_region_1_name),
+             labeller = label_wrap_gen(width = 10)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  expand_limits(y = c(0, 0.6)) +
+  labs(title = "Modelled Churn By Region1 & Product Pbl Line Name",
+       x = "2018",
+       y = "Churn Probability")
+
+rm(list = ls()); invisible(gc())
+```
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+### Churn Rate By Region1 & Tenure
+
+```{r mdl_vsl_region_tenure, eval=T, echo=F, message=F, warning=F, results='hide', fig.keep='all'}
+
+ggplot(
+  
+  # get data right
+  modeling_data <- readRDS("stats_rds/modeling_data.rds") %>% 
+    mutate(tenure_bin = ifelse(tenure_months < 13, "<1 Year",
+                               ifelse(tenure_months <= 24, "<2 Years",
+                                      ifelse(tenure_months <= 36, "<3 Years",
+                                             ifelse(tenure_months < 60, "<5 Years", ">5 Years"))))) %>%
+  mutate(tenure_bin = factor(tenure_bin, 
+                             levels = c("<1 Year", "<2 Years", "<3 Years", "<5 Years", ">5 Years"))) %>% 
+    group_by(month, auto_renewal_flag, tenure_bin, shopper_region_1_name) %>% 
+    summarise(Prob_Churn = round(mean(Probability_Churn), 2)), 
+       
+  ## ggplot     
+  aes(x = month, y = Prob_Churn, group = auto_renewal_flag, color = auto_renewal_flag)) +
+  geom_line() +
+  facet_grid(rows = vars(shopper_region_1_name),
+             cols = vars(tenure_bin),
+             labeller = label_wrap_gen(width = 10)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  expand_limits(y = c(0, 0.6)) +
+  labs(title = "Modelled Churn By Tenure Bin & Region1",
+       x = "2018",
+       y = "Churn Probability")
+
+rm(list = ls()); invisible(gc())
+```
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+## USA Drill Down
+
+### USA::Churn Rate::Long Tenure::Product
+
+```{r mdl_vsl_usa_tenure_product, eval=T, echo=F, message=F, warning=F, results='hide', fig.keep='all'}
+
+ggplot(
+  
+  # get data right
+  modeling_data <- readRDS("stats_rds/modeling_data.rds") %>% 
+    filter(shopper_region_1_name == "United States") %>% 
+    mutate(tenure_bin = ifelse(tenure_months < 13, "<1 Year",
+                               ifelse(tenure_months <= 24, "<2 Years",
+                                      ifelse(tenure_months <= 36, "<3 Years",
+                                             ifelse(tenure_months < 60, "<5 Years", ">5 Years"))))) %>%
+  mutate(tenure_bin = factor(tenure_bin, 
+                             levels = c("<1 Year", "<2 Years", "<3 Years", "<5 Years", ">5 Years"))) %>% 
+    group_by(month, auto_renewal_flag, tenure_bin, product_pnl_line_name) %>% 
+    summarise(Prob_Churn = round(mean(Probability_Churn), 2)), 
+       
+  ## ggplot     
+  aes(x = month, y = Prob_Churn, group = auto_renewal_flag, color = auto_renewal_flag)) +
+  geom_line() +
+  facet_grid(rows = vars(product_pnl_line_name),
+             cols = vars(tenure_bin),
+             labeller = label_wrap_gen(width = 10)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  expand_limits(y = c(0, 0.6)) +
+  labs(title = "Modelled Churn By Tenure Bin & Product",
+       x = "2018",
+       y = "Churn Probability")
+
+rm(list = ls()); invisible(gc())
+```
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+### USA::Churn Segmnent Size::Long Tenure::Product Pnl Line Name
+
+```{r mdl_vsl_size_churners_usa_size, eval=T, echo=F, message=F, warning=F, results='hide', fig.keep='all'}
+
+ggplot(
+  
+  # get data right
+  modeling_data <- readRDS("stats_rds/modeling_data.rds") %>% 
+    filter(shopper_region_1_name == "United States") %>% 
+    mutate(tenure_bin = ifelse(tenure_months < 13, "<1 Year",
+                               ifelse(tenure_months <= 24, "<2 Years",
+                                      ifelse(tenure_months <= 36, "<3 Years",
+                                             ifelse(tenure_months < 60, "<5 Years", ">5 Years"))))) %>%
+  mutate(tenure_bin = factor(tenure_bin, 
+                             levels = c("<1 Year", "<2 Years", "<3 Years", "<5 Years", ">5 Years"))) %>% 
+    group_by(month, auto_renewal_flag, tenure_bin, product_pnl_line_name) %>% 
+    summarise(Prob_Churn = round(mean(Probability_Churn), 2),
+              Size = n()), 
+       
+  ## ggplot     
+  aes(x = month, y = Size, group = auto_renewal_flag, color = auto_renewal_flag)) +
+  geom_line() +
+  facet_grid(rows = vars(product_pnl_line_name),
+             cols = vars(tenure_bin),
+             labeller = label_wrap_gen(width = 10)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  expand_limits(y = c(0, 0.6)) +
+  labs(title = "Segment Size By Tenure Bin & Region1",
+       x = "2018",
+       y = "Churn Denominator")
+
+rm(list = ls()); invisible(gc())
+```
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+### USA::Churn Rate::Long Tenure::CnP Hosting::Hosting Provider::12 Months Venture GCR
+
+```{r mdl_vsl_churn_usa_hosting_gcr, eval=T, echo=F, message=F, warning=F, results='hide', fig.keep='all'}
+
+# predicted churn rate by auto renewal flag
+ggplot(
+  
+  # get data right
+  modeling_data <- readRDS("stats_rds/modeling_data.rds") %>% 
+    filter(shopper_region_1_name == "United States",
+           product_pnl_line_name == "CnP Hosting") %>%
+    
+  # tenure bin
+  mutate(tenure_bin = ifelse(tenure_months < 13, "<1 Year",
+                               ifelse(tenure_months <= 24, "<2 Years",
+                                      ifelse(tenure_months <= 36, "<3 Years",
+                                             ifelse(tenure_months < 60, "<5 Years", ">5 Years"))))) %>%
+  mutate(tenure_bin = factor(tenure_bin, levels = c("<1 Year", "<2 Years", "<3 Years", "<5 Years", ">5 Years"))) %>% 
+  filter(tenure_bin == "<5 Years") %>% 
+    
+  # gcr 12 months
+  mutate(gcr_12_months_bin = ifelse(v_sum_gcr_allocated_12month < 100, "<100",
+                                     ifelse(v_sum_gcr_allocated_12month < 300, "<300",
+                                            ifelse(v_sum_gcr_allocated_12month < 500, "<500",
+                                                   ifelse(v_sum_gcr_allocated_12month < 1000, "<1000", ">1000"))))) %>%
+  mutate(gcr_12_months_bin = factor(gcr_12_months_bin, levels = c("<100", "<300", "<500", "<1000", ">1000"))) %>%
+    
+  # Hosting provider
+  mutate(hosting_provider = ifelse(v_count_internal_hosting > 0, "Internal Hosting on Venture",
+                                   ifelse(v_count_no_hosting_detected > 0, "No Hosting Detected on Venture",
+                                          ifelse(v_count_hosting_top_ten_competitor > 0, "Top Ten Hosting Competitor on Venture",
+                                                 ifelse(v_count_hosting_long_tail_competitor > 0, "Long Tail Hosting Competitor on Venture", "No Associated Venture to Infer From"))))) %>%
+  mutate(hosting_provider = factor(hosting_provider, levels = c("No Associated Venture to Infer From", "No Hosting Detected on Venture",
+                                                                "Internal Hosting on Venture", "Top Ten Hosting Competitor on Venture",
+                                                                "Long Tail Hosting Competitor on Venture"))) %>% 
+  
+  group_by(month, auto_renewal_flag, hosting_provider, gcr_12_months_bin) %>% 
+  summarise(Prob_Churn = round(mean(Probability_Churn), 2),
+            Size = n()), 
+       
+  ## ggplot     
+  aes(x = month, y = Prob_Churn, group = auto_renewal_flag, color = auto_renewal_flag)) +
+  geom_line() +
+  facet_grid(rows = vars(hosting_provider),
+             cols = vars(gcr_12_months_bin),
+             labeller = label_wrap_gen(width = 10)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  expand_limits(y = c(0, 0.6)) +
+  labs(title = "USA CnP Long Tenure Modelled Churn By Venture Hosting Provider & 12 Month Venture GCR",
+       x = "2018",
+       y = "Churn Probability")
+
+rm(list = ls()); invisible(gc())
+```
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+### USA::Churn Rate::Long Tenure::CnP Hosting::Hosting Provider::Product PNL Line::Venture Attached
+
+```{r mdl_vsl_churners_usa_venture_attached, eval=T, echo=F, message=F, warning=F, results='hide', fig.keep='all'}
+
+ggplot(
+  
+  # get data right
+  modeling_data <- readRDS("stats_rds/modeling_data.rds") %>% 
+    filter(shopper_region_1_name == "United States") %>%
+  
+  # tenure bin
+  mutate(tenure_bin = ifelse(tenure_months < 13, "<1 Year",
+                               ifelse(tenure_months <= 24, "<2 Years",
+                                      ifelse(tenure_months <= 36, "<3 Years",
+                                             ifelse(tenure_months < 60, "<5 Years", ">5 Years"))))) %>%
+  mutate(tenure_bin = factor(tenure_bin, levels = c("<1 Year", "<2 Years", "<3 Years", "<5 Years", ">5 Years"))) %>% 
+  filter(tenure_bin == "<5 Years") %>% 
+    
+  # venture attached
+  mutate(venture_attached = ifelse(v_count_ventures == 0, "No Venture",
+                                   ifelse(v_count_ventures == 1, "Single Venture", "Multiple Ventures"))) %>% 
+    mutate(venture_attached = factor(venture_attached, levels = c("No Venture", "Single Venture", "Multiple Ventures"))) %>% 
+    
+  group_by(month, auto_renewal_flag, venture_attached, product_pnl_line_name) %>% 
+  summarise(Prob_Churn = round(mean(Probability_Churn), 2),
+            Size = n()), 
+       
+  ## ggplot     
+  aes(x = month, y = Prob_Churn, group = auto_renewal_flag, color = auto_renewal_flag)) +
+  geom_line() +
+  facet_grid(rows = vars(product_pnl_line_name),
+             cols = vars(venture_attached),
+             labeller = label_wrap_gen(width = 10)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  expand_limits(y = c(0, 0.6)) +
+  labs(title = "USA CnP Long Tenure Modelled Churn By Venture Attached",
+       x = "2018",
+       y = "Churn Probability")
+
+rm(list = ls()); invisible(gc())
+```
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+### USA::Churn Segment Size::Long Tenure::CnP Hosting::Hosting Provider::Product PNL Line::Venture Attached
+
+```{r mdl_vsl_churners_usa_venture_attached_size, eval=T, echo=F, message=F, warning=F}
+
+ggplot(
+  
+  # get data right
+  modeling_data <- readRDS("stats_rds/modeling_data.rds") %>% 
+    filter(shopper_region_1_name == "United States") %>%
+  
+  # tenure bin
+  mutate(tenure_bin = ifelse(tenure_months < 13, "<1 Year",
+                               ifelse(tenure_months <= 24, "<2 Years",
+                                      ifelse(tenure_months <= 36, "<3 Years",
+                                             ifelse(tenure_months < 60, "<5 Years", ">5 Years"))))) %>%
+  mutate(tenure_bin = factor(tenure_bin, levels = c("<1 Year", "<2 Years", "<3 Years", "<5 Years", ">5 Years"))) %>% 
+  filter(tenure_bin == "<5 Years") %>% 
+    
+  # venture attached
+  mutate(venture_attached = ifelse(v_count_ventures == 0, "No Venture",
+                                   ifelse(v_count_ventures == 1, "Single Venture", "Multiple Ventures"))) %>% 
+    mutate(venture_attached = factor(venture_attached, levels = c("No Venture", "Single Venture", "Multiple Ventures"))) %>% 
+    
+  group_by(month, auto_renewal_flag, venture_attached, product_pnl_line_name) %>% 
+  summarise(Prob_Churn = round(mean(Probability_Churn), 2),
+            Size = n()), 
+       
+  ## ggplot     
+  aes(x = month, y = Size, group = auto_renewal_flag, color = auto_renewal_flag)) +
+  geom_line() +
+  facet_grid(rows = vars(product_pnl_line_name),
+             cols = vars(venture_attached),
+             labeller = label_wrap_gen(width = 10)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "USA CnP Long Tenure Modelled Churn By Venture Attached - Segment Size",
+       x = "2018",
+       y = "Churn Denominator")
+
+rm(list = ls()); invisible(gc())
+```
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
